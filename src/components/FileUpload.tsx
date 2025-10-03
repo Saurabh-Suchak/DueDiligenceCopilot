@@ -1,16 +1,19 @@
 import { useState, useCallback } from 'react';
-import { Upload, X, FileText, CircleCheck as CheckCircle2, Clock } from 'lucide-react';
+import { Upload, X, FileText, CircleCheck as CheckCircle2, Clock, CircleAlert as AlertCircle } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Button } from './ui/button';
 import { cn } from '@/lib/utils';
+import { supabase } from '@/lib/supabase';
 
-type FileStatus = 'uploading' | 'uploaded' | 'parsed' | 'indexed';
+type FileStatus = 'uploading' | 'parsing' | 'completed' | 'failed';
 
 interface UploadedFile {
   id: string;
   name: string;
   size: number;
   status: FileStatus;
+  error?: string;
+  documentId?: string;
 }
 
 export function FileUpload() {
@@ -50,7 +53,7 @@ export function FileUpload() {
     }
   }, []);
 
-  const processFiles = (fileList: File[]) => {
+  const processFiles = async (fileList: File[]) => {
     const newFiles: UploadedFile[] = fileList.map((file) => ({
       id: Math.random().toString(36).substring(7),
       name: file.name,
@@ -60,29 +63,90 @@ export function FileUpload() {
 
     setFiles((prev) => [...prev, ...newFiles]);
 
-    newFiles.forEach((file, index) => {
-      setTimeout(() => {
+    for (let i = 0; i < fileList.length; i++) {
+      const file = fileList[i];
+      const fileState = newFiles[i];
+
+      try {
+        const { data: docData, error: docError } = await supabase
+          .from('documents')
+          .insert({
+            filename: file.name,
+            status: 'processing',
+          })
+          .select()
+          .maybeSingle();
+
+        if (docError || !docData) {
+          throw new Error(docError?.message || 'Failed to create document record');
+        }
+
         setFiles((prev) =>
           prev.map((f) =>
-            f.id === file.id ? { ...f, status: 'uploaded' as FileStatus } : f
+            f.id === fileState.id ? { ...f, status: 'parsing', documentId: docData.id } : f
           )
         );
-        setTimeout(() => {
-          setFiles((prev) =>
-            prev.map((f) =>
-              f.id === file.id ? { ...f, status: 'parsed' as FileStatus } : f
-            )
-          );
-          setTimeout(() => {
-            setFiles((prev) =>
-              prev.map((f) =>
-                f.id === file.id ? { ...f, status: 'indexed' as FileStatus } : f
-              )
-            );
-          }, 800);
-        }, 800);
-      }, index * 500 + 1000);
-    });
+
+        const formData = new FormData();
+        formData.append('document', file);
+        formData.append('model', 'dpt-2-latest');
+        formData.append('split', 'page');
+
+        const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ade-parse`;
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          },
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.error || 'Failed to parse document');
+        }
+
+        const parseResult = await response.json();
+
+        const { error: updateError } = await supabase
+          .from('documents')
+          .update({
+            markdown: parseResult.markdown,
+            chunks: parseResult.chunks,
+            splits: parseResult.splits,
+            metadata: parseResult.metadata,
+            status: 'completed',
+          })
+          .eq('id', docData.id);
+
+        if (updateError) {
+          throw new Error(updateError.message);
+        }
+
+        setFiles((prev) =>
+          prev.map((f) =>
+            f.id === fileState.id ? { ...f, status: 'completed' } : f
+          )
+        );
+      } catch (error) {
+        console.error('Error processing file:', error);
+
+        setFiles((prev) =>
+          prev.map((f) =>
+            f.id === fileState.id
+              ? { ...f, status: 'failed', error: error instanceof Error ? error.message : 'Unknown error' }
+              : f
+          )
+        );
+
+        if (fileState.documentId) {
+          await supabase
+            .from('documents')
+            .update({ status: 'failed' })
+            .eq('id', fileState.documentId);
+        }
+      }
+    }
   };
 
   const removeFile = (id: string) => {
@@ -101,12 +165,12 @@ export function FileUpload() {
     switch (status) {
       case 'uploading':
         return <Clock className="h-4 w-4 text-blue-500 animate-pulse" />;
-      case 'uploaded':
-        return <CheckCircle2 className="h-4 w-4 text-green-500" />;
-      case 'parsed':
-        return <CheckCircle2 className="h-4 w-4 text-green-500" />;
-      case 'indexed':
+      case 'parsing':
+        return <Clock className="h-4 w-4 text-blue-500 animate-pulse" />;
+      case 'completed':
         return <CheckCircle2 className="h-4 w-4 text-green-600" />;
+      case 'failed':
+        return <AlertCircle className="h-4 w-4 text-red-600" />;
     }
   };
 
@@ -114,12 +178,12 @@ export function FileUpload() {
     switch (status) {
       case 'uploading':
         return 'Uploading...';
-      case 'uploaded':
-        return 'Uploaded';
-      case 'parsed':
-        return 'Parsed';
-      case 'indexed':
-        return 'Indexed';
+      case 'parsing':
+        return 'Parsing...';
+      case 'completed':
+        return 'Completed';
+      case 'failed':
+        return 'Failed';
     }
   };
 
@@ -148,7 +212,7 @@ export function FileUpload() {
             multiple
             onChange={handleFileInput}
             className="hidden"
-            accept=".pdf,.doc,.docx,.xls,.xlsx"
+            accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
           />
           <label htmlFor="file-upload" className="cursor-pointer">
             <Upload className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
@@ -156,7 +220,7 @@ export function FileUpload() {
               Drop files here or click to browse
             </p>
             <p className="text-xs text-muted-foreground">
-              Supports PDF, Word, Excel files
+              Supports PDF, Word, Excel, and image files
             </p>
           </label>
         </div>
@@ -186,6 +250,9 @@ export function FileUpload() {
                           </span>
                         </div>
                       </div>
+                      {file.error && (
+                        <p className="text-xs text-red-600 mt-1">{file.error}</p>
+                      )}
                     </div>
                   </div>
                   <Button
